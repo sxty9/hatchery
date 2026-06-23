@@ -1,0 +1,30 @@
+[package]
+name = "hatchery-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hatchery — visual probe & benchmark service for the lakearch data model. Embeds lakearch-core in-process; AI acts as the §1.5 Traverser above the kernel."
+
+[[bin]]
+name = "hatchery-server"
+path = "src/main.rs"
+
+[dependencies]
+# The thing under test — embedded in-process for the full kernel verb surface (§13/§11/§12/erase).
+# Absolute path: hatchery is glued to this host's lakearch checkout, and the sxgate
+# preview engine builds from a git worktree elsewhere on disk where a relative path
+# would not resolve.
+lakearch-core = { path = "/home/nanu/lakearch/crates/lakearch-core" }
+
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+anyhow = "1"
+base64 = "0.22"

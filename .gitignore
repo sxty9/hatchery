@@ -1,0 +1,7 @@
+/target
+**/target
+hatchery-data/
+*.redb
+node_modules/
+frontend/dist/
+.env
