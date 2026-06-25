@@ -256,6 +256,34 @@ pub async fn set_subject(
     Ok(Json(json!({ "subject": cid.map(cid_hex) })))
 }
 
+// ---------------------------------------------------------------------------
+// The lakearch spec ("Gesetzbuch") — served read-only for the in-UI viewer.
+// ---------------------------------------------------------------------------
+
+pub async fn spec_list() -> Json<Value> {
+    Json(json!({ "docs": [
+        { "id": "lakearch", "title": "lakearch — Das Datenmodell (Gesetzbuch §1–§15)" },
+        { "id": "encoding", "title": "Kanonische Kodierung & Inhalts-Identität (v1)" }
+    ]}))
+}
+
+pub async fn spec_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    // Whitelist ids → filenames (no path traversal: id never reaches the path).
+    let (file, title) = match id.as_str() {
+        "lakearch" => ("lakearch.md", "lakearch — Das Datenmodell"),
+        "encoding" => ("canonical-encoding.md", "Kanonische Kodierung & Inhalts-Identität (v1)"),
+        _ => return Err(anyhow::anyhow!("unknown spec id").into()),
+    };
+    let path = std::path::Path::new(&state.semantics_dir).join(file);
+    let markdown = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("spec not readable ({}): {e}", path.display()))?;
+    Ok(Json(json!({ "id": id, "title": title, "markdown": markdown })))
+}
+
 /// View reset: clears the active subject and the admin area grants. Does NOT
 /// delete data (lakearch is append-only, §7.1) — restart with a fresh --data-dir
 /// for an empty bestand.

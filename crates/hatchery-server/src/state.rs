@@ -52,6 +52,9 @@ pub struct AppState {
     /// `/healthz` must present it (this is how a public sxgate preview is gated —
     /// auth is the service's concern, §preview). `None` ⇒ open.
     pub password: Option<String>,
+    /// Directory holding the lakearch spec markdown (the "Gesetzbuch") shown in
+    /// the UI: `lakearch.md` + `canonical-encoding.md`.
+    pub semantics_dir: String,
 }
 
 impl AppState {

@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         active_subject: Arc::new(Mutex::new(None)),
         ai: Arc::new(ai),
         password,
+        semantics_dir: cfg.semantics_dir.clone(),
     };
 
     let app = Router::new()
@@ -100,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chat", post(ai::chat))
         .route("/api/scenarios", get(scenario::list))
         .route("/api/scenario/{id}", post(scenario::run))
+        .route("/api/spec", get(api::spec_list))
+        .route("/api/spec/{id}", get(api::spec_get))
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", any(live::ws_handler))
         .fallback_service(ServeDir::new(&cfg.frontend_dir))
@@ -150,6 +153,7 @@ struct Config {
     data_dir: String,
     addr: String,
     frontend_dir: String,
+    semantics_dir: String,
 }
 
 impl Config {
@@ -157,15 +161,17 @@ impl Config {
         let mut data_dir = "./hatchery-data".to_string();
         let mut addr = "127.0.0.1:8799".to_string();
         let mut frontend_dir = "frontend/dist".to_string();
+        let mut semantics_dir = "/home/nanu/lakearch/semantics".to_string();
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--data-dir" => data_dir = args.next().unwrap_or(data_dir),
                 "--addr" => addr = args.next().unwrap_or(addr),
                 "--frontend" => frontend_dir = args.next().unwrap_or(frontend_dir),
+                "--semantics-dir" => semantics_dir = args.next().unwrap_or(semantics_dir),
                 other => tracing::warn!(arg = other, "ignoring unknown argument"),
             }
         }
-        Config { data_dir, addr, frontend_dir }
+        Config { data_dir, addr, frontend_dir, semantics_dir }
     }
 }
