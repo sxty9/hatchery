@@ -26,7 +26,6 @@ const ROLE_COLORS = {
 }
 const roleColor = (r) => ROLE_COLORS[r] || '#c3ccd9'
 
-// Plain-language explanations for newcomers (shown on hover).
 const ROLE_HELP = {
   leaf: ['Blatt (atomares Daten)', 'Ein primitives Daten mit opaken Bytes (z. B. Text). Existiert genau einmal — gleiche Bytes = dasselbe Daten (§5.3).'],
   node: ['Knoten', 'Ein Daten, dessen Identität allein aus der Menge seiner besessenen Kontexte entsteht (§4.3). Es besitzt andere Daten als Kontexte.'],
@@ -47,7 +46,6 @@ const ROLE_HELP = {
   'active-marker': ['Aktiv-Marker (§13)', 'Ein einziges Schreiben, das einen mehrteiligen Umbau GEMEINSAM sichtbar macht. Atomarität ohne Transaktionen.'],
 }
 
-// What each axiom-lab test does, and what to watch for (newcomer-friendly).
 const SCENARIO_HELP = {
   dedup: 'Hängt zweimal dasselbe Blatt an. Erwartung: nur EIN Knoten entsteht (gleiche ContentId); der zweite „Append“ schreibt nichts. Der Dedup-Zähler oben steigt.',
   type: 'Legt ein Daten „Alice“ an und gibt ihm den Typ „Person“ — als Kontext, der auf das Typ-Daten zeigt. Kein Schema, kein Meta-Typ.',
@@ -69,7 +67,7 @@ export default function App() {
   const [graph, setGraph] = useState({ nodes: [], links: [] })
   const [mode, setMode] = useState('collapsed')
   const [scenarios, setScenarios] = useState([])
-  const [results, setResults] = useState({})
+  const [results, setResults] = useState({}) // { [sid]: { [scnId]: result } }
   const [metrics, setMetrics] = useState(null)
   const [subject, setSubject] = useState(null)
   const [aiLog, setAiLog] = useState([])
@@ -77,10 +75,12 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [detail, setDetail] = useState(null)
   const [size, setSize] = useState({ w: 800, h: 600 })
-  const [tip, setTip] = useState(null) // { x, y, title, desc }
-  const [toast, setToast] = useState(null) // last scenario result
+  const [tip, setTip] = useState(null)
+  const [toast, setToast] = useState(null)
   const [intro, setIntro] = useState(() => !localStorage.getItem('hatchery_intro_seen'))
-  const [spec, setSpec] = useState(null) // { docs, id, title, html }
+  const [spec, setSpec] = useState(null)
+  const [sessions, setSessions] = useState([])
+  const [activeSid, setActiveSid] = useState(null)
 
   const fgRef = useRef(null)
   const hostRef = useRef(null)
@@ -90,8 +90,11 @@ export default function App() {
   const animUntil = useRef(0)
   const mouse = useRef({ x: 0, y: 0 })
   const hoverNode = useRef(null)
+  const activeRef = useRef(null)
 
-  // ---- animation driver (pulses + highlight rings) ----
+  // session-scoped URL: appends ?s=<active session>
+  const S = useCallback((p) => p + (p.includes('?') ? '&' : '?') + 's=' + encodeURIComponent(activeRef.current || ''), [])
+
   const kick = useCallback((ms) => {
     animUntil.current = Math.max(animUntil.current, performance.now() + ms)
     const loop = () => {
@@ -105,9 +108,9 @@ export default function App() {
 
   // ---- data loading ----
   const loadGraph = useCallback(async () => {
-    const data = await api('/api/graph')
-    const incoming = new Map(data.nodes.map((n) => [n.id, n]))
-    const nodes = data.nodes.map((n) => {
+    const data = await api(S('/api/graph'))
+    const incoming = new Map((data.nodes || []).map((n) => [n.id, n]))
+    const nodes = (data.nodes || []).map((n) => {
       const ex = nodesById.current.get(n.id)
       if (ex) { Object.assign(ex, n); return ex }
       const obj = { ...n }
@@ -115,23 +118,45 @@ export default function App() {
       return obj
     })
     for (const id of [...nodesById.current.keys()]) if (!incoming.has(id)) nodesById.current.delete(id)
-    const links = data.edges.map((e) => ({ source: e.from, target: e.to, kind: e.kind }))
+    const links = (data.edges || []).map((e) => ({ source: e.from, target: e.to, kind: e.kind }))
     setGraph({ nodes, links })
     setSubject(data.subject || null)
-  }, [])
+  }, [S])
 
-  const loadMetrics = useCallback(async () => setMetrics(await api('/api/metrics')), [])
+  const loadMetrics = useCallback(async () => setMetrics(await api(S('/api/metrics'))), [S])
   const loadScenarios = useCallback(async () => setScenarios((await api('/api/scenarios')).scenarios || []), [])
 
-  // ---- websocket ----
+  const loadSessions = useCallback(async () => {
+    let d = await api('/api/sessions')
+    let list = d.sessions || []
+    if (list.length === 0) {
+      await api('/api/sessions', { method: 'POST', body: '{}' })
+      d = await api('/api/sessions'); list = d.sessions || []
+    }
+    setSessions(list)
+    if (!list.find((s) => s.id === activeRef.current)) {
+      activeRef.current = list[0]?.id || null
+      setActiveSid(activeRef.current)
+    }
+    return list
+  }, [])
+
+  const refreshActive = useCallback(() => {
+    nodesById.current = new Map(); highlight.current = new Set()
+    setDetail(null); loadGraph(); loadMetrics()
+  }, [loadGraph, loadMetrics])
+
+  // ---- mount: sessions then data + websocket ----
   useEffect(() => {
-    loadGraph(); loadMetrics(); loadScenarios()
+    (async () => { await loadSessions(); await loadScenarios(); loadGraph(); loadMetrics() })()
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const ws = new WebSocket(`${proto}://${location.host}/ws`)
     let timer = null
     const refresh = () => { clearTimeout(timer); timer = setTimeout(() => { loadGraph(); loadMetrics() }, 120) }
     ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data) } catch { return }
+      if (m.type === 'sessions_changed') { loadSessions(); return }
+      if (m.s && m.s !== activeRef.current) return // event for a different tab
       switch (m.type) {
         case 'ai_step': setAiLog((l) => [...l.slice(-80), m]); refresh(); break
         case 'dedup': pulses.current.set(m.id, performance.now() + 1300); kick(1300); refresh(); break
@@ -140,7 +165,7 @@ export default function App() {
       }
     }
     return () => { clearTimeout(timer); ws.close() }
-  }, [loadGraph, loadMetrics, loadScenarios, kick])
+  }, [loadSessions, loadScenarios, loadGraph, loadMetrics, kick])
 
   // ---- sizing ----
   useEffect(() => {
@@ -152,7 +177,7 @@ export default function App() {
   }, [])
 
   // ---- collapsed/expanded projection ----
-  const view = useMemo(() => {
+  const viewGraph = useMemo(() => {
     if (mode === 'expanded') return graph
     const visible = new Set(graph.nodes.filter((n) => !n.is_marker).map((n) => n.id))
     const nodes = graph.nodes.filter((n) => visible.has(n.id))
@@ -164,14 +189,12 @@ export default function App() {
     return { nodes, links }
   }, [graph, mode])
 
-  // ---- tooltips ----
   const tipFor = (title, desc) => ({
     onMouseEnter: (e) => setTip({ x: e.clientX, y: e.clientY, title, desc }),
     onMouseMove: (e) => setTip((t) => (t ? { ...t, x: e.clientX, y: e.clientY } : t)),
     onMouseLeave: () => setTip(null),
   })
 
-  // ---- focus the nodes a test touched, so newcomers SEE where it happens ----
   const focusNodes = useCallback((ids) => {
     if (!ids || !ids.length) return
     highlight.current = new Set(ids)
@@ -182,38 +205,64 @@ export default function App() {
     setTimeout(() => { highlight.current = new Set(); if (fgRef.current) fgRef.current.refresh() }, 9000)
   }, [kick])
 
-  // ---- actions ----
+  // ---- session tab actions ----
+  const switchTab = (sid) => {
+    if (sid === activeRef.current) return
+    activeRef.current = sid; setActiveSid(sid)
+    setToast(null); setAiLog([])
+    refreshActive()
+  }
+  const createTab = async () => {
+    const r = await api('/api/sessions', { method: 'POST', body: '{}' })
+    await loadSessions(); if (r.id) switchTab(r.id)
+  }
+  const deleteTab = async (sid, e) => {
+    e?.stopPropagation()
+    const wasActive = sid === activeRef.current
+    const others = sessions.filter((s) => s.id !== sid)
+    await api(`/api/sessions/${sid}`, { method: 'DELETE' })
+    setResults((m) => { const c = { ...m }; delete c[sid]; return c })
+    await loadSessions()
+    if (wasActive) { const next = others[0]?.id; if (next) switchTab(next); else refreshActive() }
+  }
+  const resetTab = async (sid, e) => {
+    e?.stopPropagation()
+    await api(`/api/sessions/${sid}/reset`, { method: 'POST' })
+    setResults((m) => ({ ...m, [sid]: {} }))
+    if (sid === activeRef.current) { setToast(null); refreshActive() }
+  }
+
+  // ---- actions (session-scoped) ----
   const runScenario = async (id) => {
-    const r = await api(`/api/scenario/${id}`, { method: 'POST' })
-    setResults((m) => ({ ...m, [id]: r }))
+    const sid = activeRef.current
+    const r = await api(S(`/api/scenario/${id}`), { method: 'POST' })
+    setResults((m) => ({ ...m, [sid]: { ...(m[sid] || {}), [id]: r } }))
     setToast(r)
     await loadGraph()
     focusNodes(r.created)
-    if (r.subject) setToast((t) => ({ ...t, subject: r.subject }))
   }
   const runAll = async () => { for (const s of scenarios) { await runScenario(s.id); await new Promise((r) => setTimeout(r, 250)) } }
 
   const setView = async (hex) => {
-    await api('/api/subject', { method: 'POST', body: JSON.stringify({ subject: hex }) })
+    await api(S('/api/subject'), { method: 'POST', body: JSON.stringify({ subject: hex }) })
     setSubject(hex || null); loadGraph()
   }
   const sendChat = async () => {
     const msg = chat.trim(); if (!msg) return
     setChat(''); setBusy(true)
-    setAiLog((l) => [...l, { type: 'ai_step', phase: 'you', note: msg }])
+    setAiLog((l) => [...l, { type: 'ai_step', phase: 'you', note: msg, s: activeRef.current }])
     try {
-      const r = await api('/api/chat', { method: 'POST', body: JSON.stringify({ message: msg }) })
-      if (r.error) setAiLog((l) => [...l, { type: 'ai_step', phase: 'error', note: r.error }])
+      const r = await api(S('/api/chat'), { method: 'POST', body: JSON.stringify({ message: msg }) })
+      if (r.error) setAiLog((l) => [...l, { type: 'ai_step', phase: 'error', note: r.error, s: activeRef.current }])
     } finally { setBusy(false); loadGraph() }
   }
   const appendLeaf = async () => {
     const t = prompt('Blatt-Inhalt (Text):'); if (t == null) return
-    const r = await api('/api/append/leaf', { method: 'POST', body: JSON.stringify({ text: t }) })
+    const r = await api(S('/api/append/leaf'), { method: 'POST', body: JSON.stringify({ text: t }) })
     await loadGraph(); if (r.id) focusNodes([r.id])
   }
-  const showNode = async (n) => setDetail(await api(`/api/node/${n.id}`).then((d) => ({ id: n.id, role: n.role, label: n.label, ...d })))
+  const showNode = async (n) => setDetail(await api(S(`/api/node/${n.id}`)).then((d) => ({ id: n.id, role: n.role, label: n.label, ...d })))
 
-  // ---- Gesetzbuch (spec) drawer ----
   const openSpec = async (id) => {
     const docs = spec?.docs || (await api('/api/spec')).docs
     const wanted = id || docs[0].id
@@ -226,14 +275,12 @@ export default function App() {
     const r = node.role === 'anchor' ? 7 : node.is_marker ? 3 : 5
     const now = performance.now()
     const hot = highlight.current.has(node.id)
-    // dedup pulse (expanding blue ring)
     const exp = pulses.current.get(node.id)
     if (exp && exp > now) {
       const t = 1 - (exp - now) / 1300
       ctx.beginPath(); ctx.arc(node.x, node.y, r + 2 + t * 16, 0, 2 * Math.PI)
       ctx.strokeStyle = `rgba(126,178,255,${1 - t})`; ctx.lineWidth = 2 / scale; ctx.stroke()
     }
-    // highlight ring for a test's touched nodes (steady gold, gentle pulse)
     if (hot) {
       const p = 0.6 + 0.4 * Math.sin(now / 180)
       ctx.beginPath(); ctx.arc(node.x, node.y, r + 5, 0, 2 * Math.PI)
@@ -244,14 +291,14 @@ export default function App() {
     ctx.globalAlpha = node.superseded ? 0.4 : 1; ctx.fill()
     if (node.role === 'anchor') { ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5 / scale; ctx.stroke() }
     ctx.globalAlpha = 1
-    if (hot || scale > 1.3) {
-      if (!node.is_marker || hot) {
-        ctx.font = `${(hot ? 11 : 10) / scale}px ui-sans-serif`
-        ctx.fillStyle = hot ? '#ffe6a8' : '#aeb8c6'
-        ctx.fillText(node.label, node.x + r + 2, node.y + 3 / scale)
-      }
+    if ((hot || scale > 1.3) && (!node.is_marker || hot)) {
+      ctx.font = `${(hot ? 11 : 10) / scale}px ui-sans-serif`
+      ctx.fillStyle = hot ? '#ffe6a8' : '#aeb8c6'
+      ctx.fillText(node.label, node.x + r + 2, node.y + 3 / scale)
     }
   }, [])
+
+  const sessResults = results[activeSid] || {}
 
   return (
     <div className="app">
@@ -259,20 +306,33 @@ export default function App() {
         <h1>hatchery <span className="dim">· lakearch lab</span></h1>
         <div className="row" style={{ width: 'auto', gap: 6 }}>
           <button className={mode === 'collapsed' ? 'primary' : ''} onClick={() => setMode('collapsed')}
-            {...tipFor('Kompakte Sicht', 'Kontext-Marker werden ausgeblendet; eine Beziehung erscheint als beschriftete Kante. Gut für den Überblick.')}>collapsed</button>
+            {...tipFor('Kompakte Sicht', 'Kontext-Marker werden ausgeblendet; eine Beziehung erscheint als beschriftete Kante.')}>collapsed</button>
           <button className={mode === 'expanded' ? 'primary' : ''} onClick={() => setMode('expanded')}
-            {...tipFor('Reifikation (§3.4)', "Jeder Kontext wird selbst als Knoten mit eigenen Kindern gezeigt. Macht sichtbar, dass ein „Kontext“ nur die Rolle eines Daten ist.")}>expanded (reified)</button>
+            {...tipFor('Reifikation (§3.4)', "Jeder Kontext wird selbst als Knoten mit eigenen Kindern gezeigt — ein „Kontext“ ist nur die Rolle eines Daten.")}>expanded (reified)</button>
         </div>
         <div className="spacer" />
         <button onClick={() => openSpec()} {...tipFor('Gesetzbuch', 'Die vollständige lakearch-Spezifikation (§1–§15) und die kanonische Kodierung — direkt hier lesen.')}>📖 Gesetzbuch</button>
         {metrics && (
           <div className="metric">
-            <span {...tipFor('Daten', 'Physisch geschriebene Daten (ohne Dedup-Treffer).')}>data <b>{metrics.append_count}</b></span> ·{' '}
-            <span {...tipFor('Dedup-Treffer (§5.3)', 'Inhaltsgleiche Appends, die NICHTS Neues schrieben — gleiche Bytes = dasselbe Daten.')}>dedup <b>{metrics.dedup_hit_count}</b></span> ·{' '}
-            <span {...tipFor('Kanten', 'Indizierte Besitz-/Verweis-Kanten (abgeleitet, neu-baubar).')}>edges <b>{metrics.edge_count}</b></span> ·{' '}
+            <span {...tipFor('Daten', 'Physisch geschriebene Daten dieser Session (ohne Dedup-Treffer).')}>data <b>{metrics.append_count}</b></span> ·{' '}
+            <span {...tipFor('Dedup-Treffer (§5.3)', 'Inhaltsgleiche Appends, die NICHTS Neues schrieben.')}>dedup <b>{metrics.dedup_hit_count}</b></span> ·{' '}
+            <span {...tipFor('Kanten', 'Indizierte Besitz-/Verweis-Kanten (abgeleitet).')}>edges <b>{metrics.edge_count}</b></span> ·{' '}
             <span {...tipFor('Watermark (§13)', 'Committete Log-Bytes — die Linearisierungsstelle der durablen Sicht.')}>W <b>{metrics.committed_bytes}</b>B</span>
           </div>
         )}
+      </div>
+
+      {/* SESSION TABS — each is its own lakearch instance */}
+      <div className="tabsbar">
+        {sessions.map((s) => (
+          <div key={s.id} className={`tab ${s.id === activeSid ? 'active' : ''}`} onClick={() => switchTab(s.id)}
+            {...tipFor(`Session „${s.title}“`, 'Eine eigene, isolierte lakearch-Instanz (eigener Bestand). ↻ leert ihre Daten, ✕ entfernt sie. Tabs sind unabhängig.')}>
+            <span className="tab-title">{s.title}</span>
+            <span className="tab-btn" onClick={(e) => resetTab(s.id, e)} title="zurücksetzen (Daten leeren)">↻</span>
+            {sessions.length > 1 && <span className="tab-btn" onClick={(e) => deleteTab(s.id, e)} title="Session schließen">✕</span>}
+          </div>
+        ))}
+        <button className="tab-add" onClick={createTab} {...tipFor('Neue Session', 'Legt eine weitere isolierte lakearch-Instanz an (neuer Tab). Beliebig viele möglich.')}>+ Session</button>
       </div>
 
       <div className="main"
@@ -282,7 +342,7 @@ export default function App() {
             ref={fgRef}
             width={size.w}
             height={size.h}
-            graphData={view}
+            graphData={viewGraph}
             backgroundColor="#0c0f14"
             nodeId="id"
             nodeCanvasObject={paintNode}
@@ -302,9 +362,8 @@ export default function App() {
           />
         </div>
 
-        {/* LEFT: axiom lab + controls */}
         <div className="overlay left">
-          <div className="panel-title" {...tipFor('Lesen geht durchs Tor (§11)', "„admin“ sieht alles. Als Subjekt siehst du nur, wozu es berechtigt ist — der Rest VERSCHWINDET (VANISH), ununterscheidbar von „existiert nicht“.")}>view as subject (§11)</div>
+          <div className="panel-title" {...tipFor('Lesen geht durchs Tor (§11)', "„admin“ sieht alles. Als Subjekt siehst du nur, wozu es berechtigt ist — der Rest VERSCHWINDET (VANISH).")}>view as subject (§11)</div>
           <div className="row">
             <select value={subject || ''} onChange={(e) => setView(e.target.value || null)}>
               <option value="">admin · all areas</option>
@@ -315,14 +374,14 @@ export default function App() {
             onKeyDown={(e) => { if (e.key === 'Enter') setView(e.target.value.trim() || null) }} />
 
           <hr />
-          <div className="panel-title" {...tipFor('Axiom-Lab', 'Jeder Test legt echte Daten in lakearch ab, prüft ein Axiom und HEBT die betroffenen Knoten im Graph hervor (gold). Fahre über einen Test für Details.')}>axiom lab · hover für Erklärung</div>
+          <div className="panel-title" {...tipFor('Axiom-Lab', 'Jeder Test legt echte Daten in DIESE Session, prüft ein Axiom und HEBT die betroffenen Knoten gold hervor. Hover für Details.')}>axiom lab · hover für Erklärung</div>
           <div className="row" style={{ marginBottom: 6 }}>
-            <button onClick={runAll} {...tipFor('Alle Tests', 'Führt alle Szenarien nacheinander aus.')}>run all</button>
-            <button onClick={() => api('/api/reset', { method: 'POST' }).then(loadGraph)} {...tipFor('Sicht zurücksetzen', 'Setzt Subjekt + Bereichs-Grants zurück (löscht KEINE Daten — append-only §7.1).')}>reset view</button>
+            <button onClick={runAll} {...tipFor('Alle Tests', 'Führt alle Szenarien nacheinander in dieser Session aus.')}>run all</button>
+            <button onClick={() => api(S('/api/reset'), { method: 'POST' }).then(loadGraph)} {...tipFor('Sicht zurücksetzen', 'Setzt Subjekt + Bereichs-Grants zurück (löscht KEINE Daten — dafür ↻ am Tab).')}>reset view</button>
             <button onClick={appendLeaf} {...tipFor('Blatt anlegen', 'Hängt ein atomares Blatt mit deinem Text an (§7.1).')}>+ leaf</button>
           </div>
           {scenarios.map((s) => {
-            const r = results[s.id]
+            const r = sessResults[s.id]
             return (
               <div className="scn" key={s.id} {...tipFor(`${s.axiom} · ${s.title}`, SCENARIO_HELP[s.id] || '')}>
                 <span className="ax">{s.axiom}</span>
@@ -335,15 +394,11 @@ export default function App() {
           })}
 
           <hr />
-          <div className="panel-title" {...tipFor('Rollen', 'Die Farbe eines Knotens zeigt die Rolle, die seine Kontexte ihm geben (§3.1). Fahre über einen Eintrag für die Bedeutung.')}>legend · hover für Bedeutung</div>
+          <div className="panel-title" {...tipFor('Rollen', 'Die Farbe eines Knotens zeigt die Rolle, die seine Kontexte ihm geben (§3.1).')}>legend · hover für Bedeutung</div>
           <div className="legend">
             {Object.entries(ROLE_COLORS).map(([role, c]) => {
               const [t, d] = ROLE_HELP[role] || [role, '']
-              return (
-                <span className="item" key={role} {...tipFor(t, d)}>
-                  <span className="dot" style={{ background: c }} />{role}
-                </span>
-              )
+              return (<span className="item" key={role} {...tipFor(t, d)}><span className="dot" style={{ background: c }} />{role}</span>)
             })}
           </div>
 
@@ -362,12 +417,11 @@ export default function App() {
           )}
         </div>
 
-        {/* RIGHT: AI traverser log */}
         <div className="overlay right">
-          <div className="panel-title" {...tipFor('Die Schicht über lakearch (§1.5)', 'Die KI rechnet, platziert und entscheidet; lakearch speichert/traversiert/matcht nur. Sie orientiert sich, entscheidet, und schreibt per append.')}>AI traverser (§1.5)</div>
+          <div className="panel-title" {...tipFor('Die Schicht über lakearch (§1.5)', 'Die KI rechnet, platziert und entscheidet; lakearch speichert/traversiert/matcht nur. Sie schreibt in die aktive Session.')}>AI traverser (§1.5)</div>
           <div className="ailog">
-            {aiLog.length === 0 && <div className="hint">Tippe unten einen Satz. Die KI orientiert sich, entscheidet und legt Daten in lakearch ab — als Schicht über dem Kernel.</div>}
-            {aiLog.map((s, i) => (
+            {aiLog.filter((s) => !s.s || s.s === activeSid).length === 0 && <div className="hint">Tippe unten einen Satz. Die KI legt Daten in DIESE Session ab — als Schicht über dem Kernel.</div>}
+            {aiLog.filter((s) => !s.s || s.s === activeSid).map((s, i) => (
               <div className={`step ${s.phase === 'error' ? 'err' : ''}`} key={i}>
                 {s.phase === 'you' && <div><b>du:</b> {s.note}</div>}
                 {s.phase === 'start' && <div className="hint">denkt nach…</div>}
@@ -379,7 +433,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* TOAST: what the last test did + where to look */}
         {toast && (
           <div className={`toast ${toast.passed ? 'ok' : 'bad'}`}>
             <div className="t-head">
@@ -395,11 +448,10 @@ export default function App() {
           </div>
         )}
 
-        {/* INTRO hint for first-time visitors */}
         {intro && (
           <div className="intro">
-            <b>Willkommen.</b> hatchery testet das Datenmodell <i>lakearch</i> sichtbar. Fahre mit der Maus über <b>Tests</b>, <b>Knoten</b> und die <b>Legende</b> für Erklärungen.
-            Ein Test hebt die betroffenen Knoten <b>gold</b> hervor. Das ganze Regelwerk steht unter <b>📖 Gesetzbuch</b>.
+            <b>Willkommen.</b> hatchery testet das Datenmodell <i>lakearch</i> sichtbar. Jeder <b>Tab oben</b> ist eine eigene Instanz. Fahre mit der Maus über <b>Tests</b>, <b>Knoten</b> und die <b>Legende</b> für Erklärungen.
+            Ein Test hebt die betroffenen Knoten <b>gold</b> hervor. Das Regelwerk steht unter <b>📖 Gesetzbuch</b>.
             <button onClick={() => { setIntro(false); localStorage.setItem('hatchery_intro_seen', '1') }}>verstanden</button>
           </div>
         )}
@@ -411,7 +463,6 @@ export default function App() {
         <button className="primary" disabled={busy} onClick={sendChat}>{busy ? '…' : 'traverse'}</button>
       </div>
 
-      {/* GESETZBUCH drawer */}
       {spec && (
         <div className="drawer-backdrop" onClick={() => setSpec(null)}>
           <div className="drawer" onClick={(e) => e.stopPropagation()}>
@@ -428,7 +479,6 @@ export default function App() {
         </div>
       )}
 
-      {/* floating tooltip */}
       {tip && (
         <div className="tip" style={{ left: Math.min(tip.x + 14, window.innerWidth - 320), top: Math.min(tip.y + 16, window.innerHeight - 120) }}>
           <div className="tip-title">{tip.title}</div>

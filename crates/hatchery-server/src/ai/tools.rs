@@ -9,7 +9,9 @@ use lakearch_core::{
 };
 use serde_json::{json, Value};
 
-use crate::state::{decode_visible, AppState, Kernel};
+use std::sync::Arc;
+
+use crate::state::{decode_visible, Kernel, Session};
 use crate::util::{cid_hex, parse_cid};
 use crate::vocab;
 
@@ -60,19 +62,15 @@ fn parse_strength(s: &str) -> IdentityStrength {
 
 /// Execute a tool by name. Returns a small JSON result fed back to Claude as a
 /// `tool_result`. Write tools emit a `changed` live event so the SPA refreshes.
-pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Result<Value> {
-    let admin_areas: Vec<ContentId> = state
-        .known_areas
-        .lock()
-        .map(|g| g.iter().copied().collect())
-        .unwrap_or_default();
+pub async fn dispatch(session: &Arc<Session>, name: &str, input: &Value) -> anyhow::Result<Value> {
+    let admin_areas: Vec<ContentId> = session.known_areas_vec();
 
     let out: anyhow::Result<Value> = match name {
         // ---------------- read / orient ----------------
         "get" => {
             let id = req_cid(input, "id")?;
             let areas = admin_areas.clone();
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     let cap = k.authorize(GrantedScopes::from_scope_ids(areas), snap)?;
@@ -98,7 +96,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
             let max_depth = opt_u64(input, "max_depth", 6) as u32;
             let max_nodes = opt_u64(input, "max_nodes", 256);
             let areas = admin_areas.clone();
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     let cap = k.authorize(GrantedScopes::from_scope_ids(areas), snap)?;
@@ -119,7 +117,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
         "content_equal" => {
             let a = req_cid(input, "a")?;
             let b = req_cid(input, "b")?;
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     Ok(json!({ "equal": k.content_equal(a, b, snap)? }))
@@ -130,7 +128,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
             let ctx = req_cid(input, "ctx")?;
             let target = req_cid(input, "target")?;
             let areas = admin_areas.clone();
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     let cap = k.authorize(GrantedScopes::from_scope_ids(areas), snap)?;
@@ -142,7 +140,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
             let elem = req_cid(input, "elem")?;
             let set_ctx = req_cid(input, "set_ctx")?;
             let areas = admin_areas.clone();
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     let cap = k.authorize(GrantedScopes::from_scope_ids(areas), snap)?;
@@ -153,7 +151,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
         "find_dependents" => {
             let id = req_cid(input, "input")?;
             let areas = admin_areas.clone();
-            Ok(state
+            Ok(session
                 .read(move |k| {
                     let snap = k.pin_snapshot()?;
                     let cap = k.authorize(GrantedScopes::from_scope_ids(areas), snap)?;
@@ -166,7 +164,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
         // ---------------- write / append (§7.1) ----------------
         "append_leaf" => {
             let text = req_str(input, "text")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     let d = Datum::leaf(text.into_bytes());
                     let id = ContentId::of_datum(&d);
@@ -175,13 +173,13 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "id": cid_hex(id), "deduped": existed }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "append_node" => {
             let owns = list_cids(input, "owns")?;
             anyhow::ensure!(!owns.is_empty(), "a node must own at least one context (§K2.1)");
-            let r = state
+            let r = session
                 .read(move |k| {
                     let d = Datum::node(owns).ok_or(lakearch_core::KernelError::Inconsistent)?;
                     let id = ContentId::of_datum(&d);
@@ -190,14 +188,14 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "id": cid_hex(id), "deduped": existed }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "relate" => {
             // Build a context {relation, target}; return its id for the owner to own.
             let relation = req_str(input, "relation")?;
             let target = req_cid(input, "target")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     let rel_id = k.append(&Datum::leaf(relation.into_bytes()))?;
                     let ctx = Datum::node([rel_id, target]).ok_or(lakearch_core::KernelError::Inconsistent)?;
@@ -205,14 +203,14 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "relation_id": cid_hex(rel_id), "context_id": cid_hex(ctx_id) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "set_type" => {
             // Type is a context pointing at a type datum (§4); tag it with the
             // hatchery type marker so the viz colors it.
             let type_name = req_str(input, "type_name")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     let m = k.append(&vocab::hatchery_type_marker())?;
                     let t = k.append(&Datum::leaf(type_name.into_bytes()))?;
@@ -221,13 +219,13 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "type_id": cid_hex(t), "context_id": cid_hex(ctx_id) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "supersede" => {
             let older = req_cid(input, "older")?;
             let new_owns = list_cids(input, "new_owns")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     k.append(&Datum::supersession_marker())?;
                     let sup_id = k.append(&Datum::supersedes(older))?;
@@ -238,14 +236,14 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "newer_id": cid_hex(newer_id), "supersedes_context": cid_hex(sup_id) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "set_time" => {
             // Returns a time context for the carrier to own (§6.2).
             let axis = opt_str(input, "axis").unwrap_or_else(|| "validity".to_string());
             let time_value = req_str(input, "time_value")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     let tv = k.append(&Datum::leaf(time_value.into_bytes()))?;
                     let (marker, ctx) = if axis == "recording" {
@@ -258,7 +256,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "time_context": cid_hex(ctx_id), "time_value": cid_hex(tv), "axis": axis }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "assert_identity" => {
@@ -266,33 +264,33 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
             let b = req_cid(input, "b")?;
             let strength = parse_strength(&opt_str(input, "strength").unwrap_or_default());
             let subs = list_cids(input, "sub_contexts")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     k.append(&Datum::identity_strength_marker(strength))?;
                     let id = k.append(&Datum::graded_identity(a, b, strength, subs))?;
                     Ok(json!({ "identity_id": cid_hex(id) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "make_anchor" => {
             let payload = list_cids(input, "payload")?;
-            let r = state
+            let r = session
                 .read(move |k| {
                     k.append(&Datum::anchor_marker())?;
                     let id = k.append(&Datum::anchor(payload))?;
                     Ok(json!({ "anchor_id": cid_hex(id) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "add_member" => {
             // Returns a membership context for the representative to own (§9.1/§9.3).
             let anchor = req_cid(input, "anchor")?;
             let grade = req_str(input, "grade").unwrap_or_else(|_| "1.0".to_string());
-            let r = state
+            let r = session
                 .read(move |k| {
                     k.append(&Datum::membership_grade_marker())?;
                     k.append(&Datum::membership_marker())?;
@@ -302,14 +300,14 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "membership_context": cid_hex(mem) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         "materialize" => {
             let payload = list_cids(input, "payload")?;
             let inputs = list_cids(input, "inputs")?;
             let replaces = opt_str(input, "replaces").and_then(|s| parse_cid(&s).ok());
-            let r = state
+            let r = session
                 .read(move |k| {
                     k.append(&Datum::origin_marker())?;
                     for inp in &inputs {
@@ -321,7 +319,7 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
                     Ok(json!({ "result_id": cid_hex(rid), "link": link.map(cid_hex) }))
                 })
                 .await?;
-            changed(state);
+            changed(session);
             Ok(r)
         }
         other => Err(anyhow::anyhow!("unknown tool '{other}'")),
@@ -329,8 +327,8 @@ pub async fn dispatch(state: &AppState, name: &str, input: &Value) -> anyhow::Re
     out
 }
 
-fn changed(state: &AppState) {
-    state.emit(json!({ "type": "changed" }));
+fn changed(session: &Arc<Session>) {
+    session.emit(json!({ "type": "changed" }));
 }
 
 /// The JSON tool schemas advertised to Claude.

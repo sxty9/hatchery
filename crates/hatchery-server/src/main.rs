@@ -14,22 +14,20 @@ mod util;
 mod viz_model;
 mod vocab;
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::Router;
 use base64::Engine;
-use lakearch_core::LakearchKernel;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
-use crate::state::{AiConfig, AppState};
+use crate::state::{AiConfig, AppState, SessionManager};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,11 +38,18 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_args();
     std::fs::create_dir_all(&cfg.data_dir)?;
 
-    let kernel = LakearchKernel::open(&cfg.data_dir)
-        .map_err(|e| anyhow::anyhow!("failed to open lakearch bestand at {}: {e}", cfg.data_dir))?;
-    tracing::info!(dir = %cfg.data_dir, "opened lakearch bestand (embedded, §2.3)");
-
     let (tx, _rx) = tokio::sync::broadcast::channel(2048);
+
+    // Each session is its own lakearch bestand under <data-dir>/sessions. Stale
+    // instances from a previous run are wiped (sessions are ephemeral).
+    let sessions_base = std::path::Path::new(&cfg.data_dir).join("sessions");
+    let _ = std::fs::remove_dir_all(&sessions_base);
+    std::fs::create_dir_all(&sessions_base)?;
+    let sessions = Arc::new(SessionManager::new(sessions_base, tx.clone()));
+    sessions
+        .create(Some("Session 1".to_string()))
+        .map_err(|e| anyhow::anyhow!("could not open initial session: {e}"))?;
+    tracing::info!(dir = %cfg.data_dir, "session manager ready (one bestand per session, §2.3)");
 
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
         std::fs::read_to_string("/etc/hatchery/anthropic-key")
@@ -81,10 +86,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState {
-        kernel: Arc::new(kernel),
+        sessions,
         tx,
-        known_areas: Arc::new(Mutex::new(HashSet::new())),
-        active_subject: Arc::new(Mutex::new(None)),
         ai: Arc::new(ai),
         password,
         semantics_dir: cfg.semantics_dir.clone(),
@@ -103,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/scenario/{id}", post(scenario::run))
         .route("/api/spec", get(api::spec_list))
         .route("/api/spec/{id}", get(api::spec_get))
+        .route("/api/sessions", get(api::sessions_list).post(api::sessions_create))
+        .route("/api/sessions/{id}", delete(api::sessions_delete))
+        .route("/api/sessions/{id}/reset", post(api::sessions_reset))
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", any(live::ws_handler))
         .fallback_service(ServeDir::new(&cfg.frontend_dir))

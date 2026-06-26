@@ -5,11 +5,12 @@
 mod anthropic;
 mod tools;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::api::SessionQ;
 use crate::state::{AppError, AppState};
 
 const SYSTEM_PROMPT: &str = "\
@@ -44,8 +45,10 @@ pub struct ChatReq {
 /// returns the final assistant text plus the list of tool steps taken.
 pub async fn chat(
     State(state): State<AppState>,
+    Query(q): Query<SessionQ>,
     Json(req): Json<ChatReq>,
 ) -> Result<Json<Value>, AppError> {
+    let session = state.session(q.s.as_deref())?;
     let key = state
         .ai
         .api_key
@@ -55,7 +58,7 @@ pub async fn chat(
     let client = anthropic::Client::new();
     let tools = tools::tool_specs();
 
-    state.emit(json!({ "type": "ai_step", "phase": "start", "note": req.message }));
+    session.emit(json!({ "type": "ai_step", "phase": "start", "note": req.message }));
 
     let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": req.message })];
     let mut steps: Vec<Value> = Vec::new();
@@ -81,9 +84,9 @@ pub async fn chat(
                     let tname = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let tuid = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let tinput = b.get("input").cloned().unwrap_or_else(|| json!({}));
-                    state.emit(json!({ "type": "ai_step", "phase": "tool", "tool": tname, "input": tinput }));
+                    session.emit(json!({ "type": "ai_step", "phase": "tool", "tool": tname, "input": tinput }));
 
-                    match tools::dispatch(&state, tname, &tinput).await {
+                    match tools::dispatch(&session, tname, &tinput).await {
                         Ok(result) => {
                             steps.push(json!({ "tool": tname, "input": tinput, "result": result }));
                             tool_results.push(json!({
@@ -118,7 +121,7 @@ pub async fn chat(
         break;
     }
 
-    state.emit(json!({ "type": "ai_step", "phase": "done", "note": final_text }));
-    state.emit(json!({ "type": "changed" }));
+    session.emit(json!({ "type": "ai_step", "phase": "done", "note": final_text }));
+    session.emit(json!({ "type": "changed" }));
     Ok(Json(json!({ "text": final_text, "steps": steps })))
 }

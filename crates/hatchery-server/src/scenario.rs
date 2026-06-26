@@ -6,7 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use lakearch_core::{
     CancelFlag, ContentId, Datum, Direction, GrantedScopes, Kernel as _, KernelError,
@@ -14,6 +14,7 @@ use lakearch_core::{
 };
 use serde_json::{json, Value};
 
+use crate::api::SessionQ;
 use crate::state::{AppError, AppState, Kernel};
 use crate::util::cid_hex;
 use crate::vocab;
@@ -45,10 +46,12 @@ pub async fn list(State(_state): State<AppState>) -> Json<Value> {
 
 pub async fn run(
     State(state): State<AppState>,
+    Query(q): Query<SessionQ>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    let session = state.session(q.s.as_deref())?;
     let s = salt();
-    let (result, areas) = state
+    let (result, areas) = session
         .read(move |k| match id.as_str() {
             "dedup" => scn_dedup(k, s),
             "type" => scn_type(k, s),
@@ -63,10 +66,10 @@ pub async fn run(
         })
         .await?;
     for a in areas {
-        state.register_area(a);
+        session.register_area(a);
     }
-    state.emit(json!({ "type": "scenario", "id": result.get("id").cloned() }));
-    state.emit(json!({ "type": "changed" }));
+    session.emit(json!({ "type": "scenario", "id": result.get("id").cloned() }));
+    session.emit(json!({ "type": "changed" }));
     Ok(Json(result))
 }
 
