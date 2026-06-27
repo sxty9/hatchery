@@ -16,9 +16,9 @@ use lakearch_core::{
     CancelFlag, ContentId, Datum, Direction, GrantedScopes, Kernel as _, KernelError,
     LakearchKernel, TraversalParams,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::SessionQ;
 use crate::state::{AppError, AppState, Kernel};
 use crate::util::cid_hex;
 use crate::vocab;
@@ -47,16 +47,26 @@ pub async fn list(State(_state): State<AppState>) -> Json<Value> {
     ]}))
 }
 
+/// Query for `POST /api/scenario/{id}`: the session plus an optional `name` that
+/// the **type** scenario uses as the person's value (so re-runs add a fresh node
+/// instead of deduplicating a hardcoded "Alice"); ignored by the other scenarios.
+#[derive(Deserialize)]
+pub struct RunQ {
+    pub s: Option<String>,
+    pub name: Option<String>,
+}
+
 pub async fn run(
     State(state): State<AppState>,
-    Query(q): Query<SessionQ>,
+    Query(q): Query<RunQ>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let session = state.session(q.s.as_deref())?;
+    let name = q.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let (result, areas) = session
         .read(move |k| match id.as_str() {
             "dedup" => scn_dedup(k),
-            "type" => scn_type(k),
+            "type" => scn_type(k, name.as_deref()),
             "traversal" => scn_traversal(k),
             "supersession" => scn_supersession(k),
             "gate" => scn_gate(k),
@@ -97,12 +107,13 @@ fn scn_dedup(k: &Kernel) -> ScnOut {
     ))
 }
 
-fn scn_type(k: &Kernel) -> ScnOut {
+fn scn_type(k: &Kernel, name: Option<&str>) -> ScnOut {
+    let person = name.unwrap_or("Alice");
     let tm = k.append(&vocab::hatchery_type_marker())?;
     let tname = k.append(&Datum::leaf(b"Person".to_vec()))?;
     let tctx = Datum::node([tm, tname]).ok_or(KernelError::Inconsistent)?;
     let tctx_id = k.append(&tctx)?;
-    let content = k.append(&Datum::leaf(b"Alice".to_vec()))?;
+    let content = k.append(&Datum::leaf(person.as_bytes().to_vec()))?;
     let entity = Datum::node([content, tctx_id]).ok_or(KernelError::Inconsistent)?;
     let entity_id = k.append(&entity)?;
     let snap = k.pin_snapshot()?;
@@ -110,7 +121,7 @@ fn scn_type(k: &Kernel) -> ScnOut {
     Ok((
         json!({
             "id":"type","axiom":"§4","title":"Typ als Kontext","passed":passed,
-            "detail":"Typ ist ein Kontext, der auf ein Typ-Daten zeigt (kein Meta-Typ-Regress).",
+            "detail": format!("„{person}“ bekommt den Typ „Person“ — ein Kontext, der auf das Typ-Daten zeigt (kein Schema, kein Meta-Typ-Regress)."),
             "created":[cid_hex(entity_id), cid_hex(tctx_id), cid_hex(tname)]
         }),
         vec![],

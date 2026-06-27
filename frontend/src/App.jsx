@@ -48,7 +48,7 @@ const ROLE_HELP = {
 
 const SCENARIO_HELP = {
   dedup: 'Hängt zweimal dasselbe Blatt an. Erwartung: nur EIN Knoten entsteht (gleiche ContentId); der zweite „Append“ schreibt nichts. Der Dedup-Zähler oben steigt.',
-  type: 'Legt ein Daten „Alice“ an und gibt ihm den Typ „Person“ — als Kontext, der auf das Typ-Daten zeigt. Kein Schema, kein Meta-Typ.',
+  type: 'Legt ein Daten mit dem eingegebenen Namen (Vorgabe „Alice“) an und gibt ihm den Typ „Person“ — als Kontext, der auf das Typ-Daten zeigt. Kein Schema, kein Meta-Typ.',
   traversal: 'Baut eine Kette aus 5 Knoten und traversiert sie. Erwartung: 4 Schritte, beschränkt und zyklensicher (terminiert immer).',
   supersession: 'Schreibt v2, das v1 überholt. v1 bleibt erhalten (gedimmt), v2 zeigt per Ersetzungs-Kontext darauf. Welche „gilt“, entscheidet erst das Lesen (§6.4).',
   gate: 'Legt ein geheimes Daten in einem Bereich an + ein berechtigtes Subjekt. Ohne Recht VERSCHWINDET das Daten (VANISH). Danach „Subjekt-Sicht“ wählen, um es ein-/ausblenden zu sehen.',
@@ -72,6 +72,7 @@ export default function App() {
   const [subject, setSubject] = useState(null)
   const [aiLog, setAiLog] = useState([])
   const [chat, setChat] = useState('')
+  const [typeName, setTypeName] = useState('')
   const [busy, setBusy] = useState(false)
   const [detail, setDetail] = useState(null)
   const [size, setSize] = useState({ w: 800, h: 600 })
@@ -233,9 +234,11 @@ export default function App() {
   }
 
   // ---- actions (session-scoped) ----
-  const runScenario = async (id) => {
+  const runScenario = async (id, name) => {
     const sid = activeRef.current
-    const r = await api(S(`/api/scenario/${id}`), { method: 'POST' })
+    let path = S(`/api/scenario/${id}`)
+    if (name) path += `&name=${encodeURIComponent(name)}`
+    const r = await api(path, { method: 'POST' })
     setResults((m) => ({ ...m, [sid]: { ...(m[sid] || {}), [id]: r } }))
     setToast(r)
     await loadGraph()
@@ -388,7 +391,16 @@ export default function App() {
                 <span className="name">{s.title}</span>
                 {r && <span className={`badge ${r.passed ? 'pass' : 'fail'}`}>{r.passed ? 'PASS' : 'FAIL'}</span>}
                 {r && r.subject && <button onClick={() => setView(r.subject)} {...tipFor('Subjekt-Sicht', 'Als das berechtigte Subjekt lesen — beobachte, wie das geschützte Daten erscheint/verschwindet (VANISH).')}>👁</button>}
-                <button onClick={() => runScenario(s.id)} {...tipFor('Test ausführen', 'Führt das Szenario aus und zoomt auf die betroffenen Knoten.')}>▶</button>
+                {s.id === 'type' && (
+                  <input
+                    value={typeName}
+                    placeholder="Name (z. B. Alice)"
+                    onChange={(e) => setTypeName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') runScenario('type', typeName.trim() || undefined) }}
+                    {...tipFor('Name der Person', 'Wird als Inhalts-Blatt unter dem Typ „Person" angelegt. Neuer Name ⇒ neuer Knoten; derselbe Name dedupliziert (§5.3).')}
+                  />
+                )}
+                <button onClick={() => runScenario(s.id, s.id === 'type' ? (typeName.trim() || undefined) : undefined)} {...tipFor('Test ausführen', 'Führt das Szenario aus und zoomt auf die betroffenen Knoten.')}>▶</button>
               </div>
             )
           })}
