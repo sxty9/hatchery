@@ -266,12 +266,24 @@ fn scn_anchor(k: &Kernel) -> ScnOut {
     let anchor_id = k.append(&Datum::anchor([name]))?;
     k.append(&Datum::membership_grade_marker())?;
     k.append(&Datum::membership_marker())?;
-    let grade = k.append(&Datum::leaf(b"0.9".to_vec()))?;
+
+    // How many representatives already resolve to this anchor? Each run adds the
+    // next one with a slightly different confidence grade — the §9 picture of many
+    // representatives collapsing onto one identity. No salt: the index `n` is
+    // genuine, monotonic content (the anchor itself stays shared/deduplicated).
+    let snap0 = k.pin_snapshot()?;
+    let cap0 = k.authorize(empty_scopes(), snap0)?;
+    let n = k.anchor_members_visible(anchor_id, &cap0, snap0)?.len() as u32 + 1;
+
+    // Confidence walks in small 0.01 steps within (0,1); the kernel never reads it.
+    let grade_str = format!("0.{}", 80 + (n - 1) % 20);
+    let grade = k.append(&Datum::leaf(grade_str.as_bytes().to_vec()))?;
     k.append(&Datum::membership_grade(grade))?;
     let mem = k.append(&Datum::membership(anchor_id, grade))?;
-    let rep_c = k.append(&Datum::leaf(b"rep-Alice".to_vec()))?;
+    let rep_c = k.append(&Datum::leaf(format!("rep-Alice-{n}").into_bytes()))?;
     let rep = Datum::node([rep_c, mem]).ok_or(KernelError::Inconsistent)?;
     let rep_id = k.append(&rep)?;
+
     let snap = k.pin_snapshot()?;
     let cap = k.authorize(empty_scopes(), snap)?;
     let members = k.anchor_members_visible(anchor_id, &cap, snap)?;
@@ -279,7 +291,7 @@ fn scn_anchor(k: &Kernel) -> ScnOut {
     Ok((
         json!({
             "id":"anchor","axiom":"§9.1","title":"Anker / Repräsentanten","passed":passed,
-            "detail":"Repräsentanten verweisen per gradierter Mitgliedschaft auf den Anker (die Klasse); der Kernel wertet den Grad nie.",
+            "detail": format!("Repräsentant rep-Alice-{n} (Konfidenz {grade_str}) verweist per gradierter Mitgliedschaft auf denselben Anker; jetzt {} Repräsentant(en) — der Kernel wertet den Grad nie.", members.len()),
             "created":[cid_hex(anchor_id), cid_hex(rep_id)]
         }),
         vec![],
