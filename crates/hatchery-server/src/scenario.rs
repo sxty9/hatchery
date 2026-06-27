@@ -158,20 +158,47 @@ fn scn_traversal(k: &Kernel) -> ScnOut {
 
 fn scn_supersession(k: &Kernel) -> ScnOut {
     k.append(&Datum::supersession_marker())?;
+    // Version 1 is always the bare content leaf; ensure it is present (idempotent).
     let v1 = k.append(&Datum::leaf(b"doc-v1".to_vec()))?;
-    let sup = k.append(&Datum::supersedes(v1))?;
-    let v2c = k.append(&Datum::leaf(b"doc-v2".to_vec()))?;
-    let v2 = Datum::node([v2c, sup]).ok_or(KernelError::Inconsistent)?;
-    let v2_id = k.append(&v2)?;
+
+    // Walk the existing revision chain to find the latest version present, then
+    // append the *next* version superseding it. Each run bumps the version — no
+    // salt; the version number is genuine, monotonic content like a real revision
+    // history (§7.1 append-only; nothing is ever rewritten or deleted).
+    let snap0 = k.pin_snapshot()?;
+    let cap0 = k.authorize(empty_scopes(), snap0)?;
+    let mut latest_n = 1u32;
+    let mut latest_id = v1;
+    loop {
+        let next_n = latest_n + 1;
+        let content_id = ContentId::of_datum(&Datum::leaf(format!("doc-v{next_n}").into_bytes()));
+        let sup_id = ContentId::of_datum(&Datum::supersedes(latest_id));
+        let doc = Datum::node([content_id, sup_id]).ok_or(KernelError::Inconsistent)?;
+        let doc_id = ContentId::of_datum(&doc);
+        if k.get_by_content_id(doc_id, &cap0, snap0)?.is_some() {
+            latest_n = next_n;
+            latest_id = doc_id;
+        } else {
+            break;
+        }
+    }
+
+    // Append version `latest_n + 1`, superseding the current latest.
+    let new_n = latest_n + 1;
+    let content = k.append(&Datum::leaf(format!("doc-v{new_n}").into_bytes()))?;
+    let sup = k.append(&Datum::supersedes(latest_id))?;
+    let new_doc = Datum::node([content, sup]).ok_or(KernelError::Inconsistent)?;
+    let new_id = k.append(&new_doc)?;
+
     let snap = k.pin_snapshot()?;
     let cap = k.authorize(empty_scopes(), snap)?;
-    let older = k.supersedes_visible(v2_id, &cap, snap)?;
-    let passed = older.contains(&v1);
+    let older = k.supersedes_visible(new_id, &cap, snap)?;
+    let passed = older.contains(&latest_id);
     Ok((
         json!({
             "id":"supersession","axiom":"§6.3","title":"Ersetzung (append-only)","passed":passed,
-            "detail":"v2 überholt v1; nichts gelöscht — der Kernel wählt NICHT 'die aktuelle' (§6.4).",
-            "created":[cid_hex(v2_id), cid_hex(v1)]
+            "detail": format!("doc-v{new_n} überholt doc-v{latest_n}; nichts gelöscht — der Kernel wählt NICHT 'die aktuelle' (§6.4)."),
+            "created":[cid_hex(new_id), cid_hex(latest_id)]
         }),
         vec![],
     ))
