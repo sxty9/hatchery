@@ -8,18 +8,18 @@
 //! collapse) assert robustly so they hold whether or not the data already exists;
 //! reset the session (↻) to replay the transition from a clean bestand.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use lakearch_core::{
     CancelFlag, ContentId, Datum, Direction, GrantedScopes, Kernel as _, KernelError,
-    LakearchKernel, TraversalParams,
+    TraversalParams,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::state::{AppError, AppState, Kernel};
+use crate::state::{AppError, AppState, Kernel, Session};
 use crate::util::cid_hex;
 use crate::vocab;
 
@@ -27,11 +27,10 @@ fn empty_scopes() -> GrantedScopes {
     GrantedScopes::from_scope_ids(Vec::<ContentId>::new())
 }
 
-/// Per-call counter for the federation scenario's *foreign* bestand directory.
-/// This varies only the on-disk **path** of a second kernel (so concurrent
-/// sessions never collide on the same redb file) — it is **not** a content salt;
-/// the federated payloads stay stable so the §12.3 hash-collapse is genuine.
-static FED_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Title of the dedicated tab that plays the **foreign bestand** in the federation
+/// scenario — a real sibling session the user can open and inspect (§12.3), not a
+/// throwaway temp kernel.
+const FOREIGN_TITLE: &str = "Fremdbestand";
 
 pub async fn list(State(_state): State<AppState>) -> Json<Value> {
     Json(json!({ "scenarios": [
@@ -62,6 +61,16 @@ pub async fn run(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let session = state.session(q.s.as_deref())?;
+
+    // Federation is special: it needs a *second* bestand. We simulate that as a real
+    // sibling session (a tab), so it runs outside the single-kernel `read` closure.
+    if id == "federation" {
+        let result = scn_federation(&state, &session).await?;
+        session.emit(json!({ "type": "scenario", "id": "federation" }));
+        session.emit(json!({ "type": "changed" }));
+        return Ok(Json(result));
+    }
+
     let name = q.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let (result, areas) = session
         .read(move |k| match id.as_str() {
@@ -73,7 +82,6 @@ pub async fn run(
             "provenance" => scn_provenance(k),
             "anchor" => scn_anchor(k),
             "atomicity" => scn_atomicity(k),
-            "federation" => scn_federation(k),
             _ => Ok((json!({ "error": "unknown scenario" }), vec![])),
         })
         .await?;
@@ -339,37 +347,57 @@ fn scn_atomicity(k: &Kernel) -> ScnOut {
     ))
 }
 
-fn scn_federation(k: &Kernel) -> ScnOut {
-    // The foreign bestand is a second on-disk kernel; it only needs a private path.
-    // Give it a per-call unique sub-dir (a counter, not a content salt — the payloads
-    // below stay stable so the hash-collapse is genuine) and clean it up afterwards.
-    let seq = FED_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("hatchery-fed-{seq}"));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|_| KernelError::Io)?;
-    let foreign = LakearchKernel::open(&tmp)?;
-    let shared = Datum::leaf(b"shared".to_vec());
-    let foreign_only = Datum::leaf(b"foreign-only".to_vec());
-    let shared_id = k.append(&shared)?; // present locally first
-    foreign.append(&shared)?; // identical content ⇒ same ContentId
-    let foreign_only_id = foreign.append(&foreign_only)?;
-    let (new_count, dedup_count) = k.federate(&foreign)?;
-    drop(foreign);
-    let _ = std::fs::remove_dir_all(&tmp);
-    // Robust invariant (holds on the first run AND on re-runs): after federation the
-    // foreign-only datum is now locally resolvable and the shared content collapsed
-    // by hash (≥1 dedup). The counts are reported for the first-run story.
-    let snap = k.pin_snapshot()?;
-    let cap = k.authorize(empty_scopes(), snap)?;
-    let foreign_only_local = k.get_by_content_id(foreign_only_id, &cap, snap)?.is_some();
-    let shared_local = k.get_by_content_id(shared_id, &cap, snap)?.is_some();
-    let passed = foreign_only_local && shared_local && dedup_count >= 1;
-    Ok((
-        json!({
+/// **Föderation (§12.3)** — the foreign bestand is a *real* sibling session (the
+/// dedicated `FOREIGN_TITLE` tab), seeded deterministically and merged into the
+/// caller's session by content hash. The tab stays around for the user to inspect.
+async fn scn_federation(state: &AppState, local: &Session) -> Result<Value, AppError> {
+    // Reuse the foreign tab if it exists, else spawn it — never the local session
+    // (federating a kernel with itself would deadlock its RwLock).
+    let foreign = match state
+        .sessions
+        .list()
+        .into_iter()
+        .find(|(sid, title)| title == FOREIGN_TITLE && sid != &local.sid)
+        .and_then(|(sid, _)| state.sessions.get(&sid))
+    {
+        Some(s) => s,
+        None => {
+            let s = state.sessions.create(Some(FOREIGN_TITLE.to_string()))?;
+            state.emit_global(json!({ "type": "sessions_changed" }));
+            s
+        }
+    };
+
+    let local_kernel = Arc::clone(&local.kernel);
+    let foreign_kernel = Arc::clone(&foreign.kernel);
+    let result = tokio::task::spawn_blocking(move || -> Result<Value, KernelError> {
+        let shared = Datum::leaf(b"shared".to_vec());
+        let foreign_only = Datum::leaf(b"foreign-only".to_vec());
+        // Seed the foreign tab (idempotent: append dedups on re-run).
+        foreign_kernel.append(&shared)?;
+        let foreign_only_id = foreign_kernel.append(&foreign_only)?;
+        // The local tab already holds `shared`.
+        let shared_id = local_kernel.append(&shared)?;
+        // Ingest the foreign tab into the local bestand (§12.3): content-equal data
+        // collapses by hash, genuinely-new foreign data is carried over.
+        let (new_count, dedup_count) = local_kernel.federate(foreign_kernel.as_ref())?;
+        let snap = local_kernel.pin_snapshot()?;
+        let cap = local_kernel.authorize(empty_scopes(), snap)?;
+        let foreign_only_local = local_kernel
+            .get_by_content_id(foreign_only_id, &cap, snap)?
+            .is_some();
+        let shared_local = local_kernel.get_by_content_id(shared_id, &cap, snap)?.is_some();
+        let passed = foreign_only_local && shared_local && dedup_count >= 1;
+        Ok(json!({
             "id":"federation","axiom":"§12.3","title":"Föderation / Inhalts-Kollaps","passed":passed,
-            "detail": format!("Fremdbestand aufgenommen: {new_count} neu, {dedup_count} per Inhalts-Hash kollabiert."),
+            "detail": format!("Aus Tab „Fremdbestand“ aufgenommen: {new_count} neu, {dedup_count} per Inhalts-Hash kollabiert."),
             "created":[cid_hex(shared_id), cid_hex(foreign_only_id)]
-        }),
-        vec![],
-    ))
+        }))
+    })
+    .await
+    .map_err(|_| AppError(anyhow::anyhow!("federation task panicked")))??;
+
+    // The foreign tab was seeded — refresh it for anyone viewing it.
+    foreign.emit(json!({ "type": "changed" }));
+    Ok(result)
 }
